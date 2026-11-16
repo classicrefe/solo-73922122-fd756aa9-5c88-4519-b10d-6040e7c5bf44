@@ -1,0 +1,33 @@
+name: metlake
+
+services:
+  lake-a:
+    build: .
+    image: metlake:local
+    container_name: metlake-a
+    environment:
+      DATA_DIR: /data
+      INSTANCE_NAME: node-a
+    volumes:
+      - lake-data:/data
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  lake-b:
+    build: .
+    image: metlake:local
+    container_name: metlake-b
+    environment:
+      DATA_DIR: /data
+      INSTANCE_NAME: node-b
+    volumes:
+      - lake-data:/data
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
+    depends_on:
+      - lake-a
+
+volumes:
+  lake-data:

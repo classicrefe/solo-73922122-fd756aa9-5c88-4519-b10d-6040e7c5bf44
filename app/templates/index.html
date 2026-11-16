@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>气象观测数据湖</h1>
+  <span class="sub">站号 / UTC 时刻固定 · 最多 8 个可空整数测量列 · 每批 ≤1000 行</span>
+  <span class="instance">实例 {{ settings.instance_name }} · 页面快照 v{{ ack }}</span>
+</header>
+
+<main>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+  {% if latest is not none and latest != ack %}
+  <div class="flash error">
+    页面数据生成于结构 v{{ ack }}，但当前已提交结构已是 v{{ latest }}（可能由另一实例修改）。
+    为避免覆盖他人变更，本页表单提交会因版本过期被整次拒绝；请刷新页面获取最新结构。
+  </div>
+  {% endif %}
+
+  <div class="grid">
+    <div>
+      <section class="panel">
+        <h2>
+          当前测量列
+          <span class="badge">结构 v{{ ack }}</span>
+          <span class="hint">{{ state.schema.active|length }}/8 个</span>
+        </h2>
+
+        {% if state.schema.active %}
+        <table class="data">
+          <thead>
+            <tr>
+              <th style="width:36px">#</th>
+              <th>列名</th>
+              <th>创建版本</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for field in state.schema.active %}
+            <tr>
+              <td class="muted num">{{ loop.index }}</td>
+              <td><strong>{{ field.name }}</strong></td>
+              <td class="muted num">v{{ field.created_version }}</td>
+              <td>
+                <div class="row-actions">
+                  <form class="inline-form" method="post" action="/fields/{{ field.id }}/rename">
+                    <input type="hidden" name="version" value="{{ ack }}">
+                    <input class="rename" type="text" name="name" value="{{ field.name }}"
+                           maxlength="64" required aria-label="新列名">
+                    <button class="secondary" type="submit">改名</button>
+                  </form>
+                  <form class="inline-form" method="post" action="/fields/{{ field.id }}/delete"
+                        data-confirm="删除“{{ field.name }}”后，新同名列为新字段；历史批次该列为空。历史 Parquet 不会重写。继续？">
+                    <input type="hidden" name="version" value="{{ ack }}">
+                    <button class="danger" type="submit">删除</button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="muted">当前没有测量列，CSV 只接收站号和 UTC 时刻。</p>
+        {% endif %}
+
+        <form class="stack-form" method="post" action="/fields/add" style="margin-top:14px">
+          <input type="hidden" name="version" value="{{ ack }}">
+          <span class="grow"><input type="text" name="name" placeholder="新增测量列名，如 temp_c"
+                                    maxlength="64" required {% if state.schema.active|length >= 8 %}disabled{% endif %}></span>
+          <button type="submit" {% if state.schema.active|length >= 8 %}disabled{% endif %}>新增列</button>
+        </form>
+
+        {% if state.schema.deleted %}
+        <div class="notice info">
+          已删除（历史批次对应列按空值展示，保留物理列）：
+          {% for field in state.schema.deleted %}
+            <span class="badge gray">{{ field.name }} · v{{ field.deleted_version }}</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </section>
+
+      <section class="panel">
+        <h2>
+          批次列表
+          <span class="hint">共 {{ state.batches|length }} 批；按<strong>当前</strong>列名查看</span>
+        </h2>
+        {% if state.batches %}
+        <table class="data">
+          <thead>
+            <tr>
+              <th>批次</th>
+              <th>入湖时间 (UTC)</th>
+              <th>行数</th>
+              <th>上传时结构</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for batch in state.batches %}
+            <tr>
+              <td><a href="/batches/{{ batch.id }}"><code>{{ batch.short_id }}</code></a></td>
+              <td class="num">{{ batch.created_at }}</td>
+              <td class="num">{{ batch.row_count }}</td>
+              <td class="muted num">v{{ batch.schema_version }}</td>
+              <td>
+                <div class="row-actions">
+                  <a href="/batches/{{ batch.id }}">查看</a>
+                  <a href="/batches/{{ batch.id }}/download.csv">CSV</a>
+                  <a href="/batches/{{ batch.id }}/download.parquet">Parquet</a>
+                </div>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+        <p class="muted">还没有批次。先确认结构，再用右侧上传 CSV。</p>
+        {% endif %}
+      </section>
+    </div>
+
+    <div>
+      <section class="panel">
+        <h2>上传新批次</h2>
+        <p class="hint" style="margin-top:-6px">
+          表头须含 <code>station_id</code>、<code>observed_at</code>，
+          其余列名必须与当前 v{{ ack }} 的测量列一致；每批最多 1000 行。
+        </p>
+        <form class="stack-form" method="post" action="/upload" enctype="multipart/form-data">
+          <input type="hidden" name="version" value="{{ ack }}">
+          <input class="grow" type="file" name="file" accept=".csv,text/csv" required>
+          <button type="submit">上传并转换</button>
+        </form>
+        <div class="downloads">
+          <a href="/sample.csv">下载当前结构的示例 CSV</a>
+        </div>
+        <div class="notice">
+          本次上传绑定结构 <strong>v{{ ack }}</strong>。若转换期间结构被另一实例修改，
+          整次上传会被拒绝，不会以旧结构入湖。
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>结构版本与一致性</h2>
+        <dl class="meta">
+          <dt>页面快照版本</dt><dd>v{{ ack }}</dd>
+          <dt>固定列</dt><dd>station_id, observed_at</dd>
+          <dt>数据目录</dt><dd>{{ settings.data_dir }}</dd>
+          <dt>SQLite</dt><dd>{{ settings.db_path }}</dd>
+          <dt>最新已提交</dt><dd>v{{ latest if latest is not none else "?" }}</dd>
+        </dl>
+        <div class="downloads">
+          <a href="/api/state">查看 API 状态</a>
+          <a href="/api/integrity">一致性自检</a>
+          <a href="/healthz">健康检查</a>
+        </div>
+        <div class="notice info">
+          所有新增 / 改名 / 删除 / 上传都携带本页所见的 v{{ ack }}；
+          若已被并发修改，操作整次拒绝并提示刷新，不会覆盖他人变更。
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>演示脚本</h2>
+        <ul class="plain">
+          <li>改名：把 <code>temp_c</code> 改为 <code>temperature_c</code>，旧批次仍显示旧值。</li>
+          <li>删除后同名新增：旧批次该列显示空值，不会串到新字段。</li>
+          <li>打开两个浏览器标签（或两个实例端口）同时提交，可看到过期版本被拒绝。</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 历史 Parquet 只读追加，列修改不改写文件。
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

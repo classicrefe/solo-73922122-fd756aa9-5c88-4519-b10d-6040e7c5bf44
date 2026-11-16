@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>批次 {{ batch.short_id }} · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>批次 {{ batch.short_id }}</h1>
+  <span class="sub">按展示快照 v{{ ack }} 的列名与列序展示</span>
+  <span class="instance">实例 {{ settings.instance_name }} · 快照 v{{ ack }}</span>
+</header>
+
+<main>
+  <div class="crumbs"><a href="/">← 返回数据湖</a></div>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+  {% if latest is not none and latest != ack %}
+  <div class="flash error">
+    本页基于快照 v{{ ack }}，当前已提交结构为 v{{ latest }}。刷新页面可获得最新视图；下载同样基于单次已提交快照。
+  </div>
+  {% endif %}
+
+  <section class="panel">
+    <h2>批次信息</h2>
+    <dl class="meta">
+      <dt>批次 ID</dt><dd>{{ batch.id }}</dd>
+      <dt>入湖时间</dt><dd>{{ batch.created_at }}</dd>
+      <dt>上传时结构</dt><dd>v{{ batch.schema_version }}</dd>
+      <dt>行数</dt><dd>{{ batch.row_count }}</dd>
+      <dt>Parquet</dt><dd>{{ batch.file_name }}</dd>
+      <dt>SHA-256</dt><dd>{{ batch.file_sha256 }}</dd>
+      <dt>展示快照</dt><dd>v{{ ack }}</dd>
+    </dl>
+    <div class="downloads">
+      <a href="/batches/{{ batch.id }}/download.csv">下载当前列名 CSV</a>
+      <a href="/batches/{{ batch.id }}/download.parquet">下载当前列名 Parquet</a>
+      <a href="/api/batches/{{ batch.id }}">JSON</a>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>
+      数据预览
+      <span class="badge gray">{{ rows|length }} 行 × {{ columns|length }} 列</span>
+    </h2>
+    {% if batch.schema_version != ack %}
+    <div class="notice">
+      本批上传于 v{{ batch.schema_version }}，展示快照为 v{{ ack }}。
+      改名列按新列名展示但沿用旧值；删除后同名新增的列在本批显示为空，不会串值。
+      历史 Parquet 文件未被改写。
+    </div>
+    {% endif %}
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>{% for col in columns %}<th>{{ col }}</th>{% endfor %}</tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr>
+            {% for cell in row %}
+            <td class="num{% if cell is none %} null{% endif %}">{% if cell is none %}NULL{% else %}{{ cell }}{% endif %}</td>
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 展示基于一次已提交结构与登记快照生成，下载内容同样来自该快照。
+</footer>
+</body>
+</html>
