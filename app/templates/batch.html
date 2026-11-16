@@ -38,6 +38,16 @@
       <a href="/batches/{{ batch.id }}/download.parquet">下载当前列名 Parquet</a>
       <a href="/api/batches/{{ batch.id }}">JSON</a>
     </div>
+    <form class="stack-form retire-inline" method="post" action="/batches/{{ batch.id }}/retire"
+          data-confirm="确认清退批次 {{ batch.short_id }}？受理后将永久拒绝该批的新查看及 CSV/Parquet 下载，原件在所有进行中的读取结束后物理删除，且不可恢复。">
+      <span class="grow"><input class="reason" type="text" name="reason" placeholder="清退原因（必填，最长 500 字）"
+                                maxlength="500" required aria-label="清退原因"></span>
+      <button class="danger" type="submit">清退本批</button>
+    </form>
+    <div class="notice">
+      清退受理后本批立即停止接受新读取；已在进行中的读取仍会返回完整原结果，
+      原件在其结束（或进程退出自动释放）后才会被物理删除。
+    </div>
   </section>
 
   <section class="panel">

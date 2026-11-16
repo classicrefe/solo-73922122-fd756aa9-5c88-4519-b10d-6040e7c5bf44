@@ -36,13 +36,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         lake.initialize(resolved)
+        reaper = lake.ReaperCoordinator.start(resolved)
         log.info(
-            "instance=%s data_dir=%s db=%s",
+            "instance=%s data_dir=%s db=%s reaper=%s",
             resolved.instance_name,
             resolved.data_dir,
             resolved.db_path,
+            getattr(getattr(reaper, "_thread", None), "name", "disabled"),
         )
-        yield
+        try:
+            yield
+        finally:
+            lake.ReaperCoordinator.stop(resolved)
 
     app = FastAPI(
         title="气象观测数据湖",
@@ -195,6 +200,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload, f"batch-{view.batch.short_id}.parquet", "application/vnd.apache.parquet"
         )
 
+    @app.post("/batches/{batch_id}/retire")
+    def retire_batch_form(
+        request: Request,
+        batch_id: str,
+        reason: str = Form(""),
+    ):
+        retirement = lake.request_retirement(resolved, batch_id, reason)
+        return _redirect_with_message(
+            request,
+            f"批次 {batch_id[:8]} 的清退已受理（原因：{retirement.reason}）。"
+            "该批新查看及 CSV / Parquet 下载已永久拒绝；"
+            "原件将在所有进行中的读取结束后自动物理删除，删除完成才标记“已清退”。",
+            "ok",
+            path="/retirements",
+        )
+
+    @app.get("/retirements", response_class=HTMLResponse)
+    def retirements_page(request: Request):
+        state = lake.read_state(resolved)
+        by_batch = {r.batch_id: r for r in state.retirements}
+        return _render(
+            request,
+            "retirements.html",
+            settings=resolved,
+            retirements=state.retirements,
+            batches=state.batches,
+            by_batch=by_batch,
+            msg=request.query_params.get("msg"),
+            kind=request.query_params.get("kind", "info"),
+        )
+
     # ------------------------------------------------------------------
     # JSON API（演示双进程与脚本自测）
     # ------------------------------------------------------------------
@@ -214,9 +250,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/state")
     def api_state():
         state = lake.read_state(resolved)
+        by_batch = {r.batch_id: r for r in state.retirements}
         return {
             "schema": _schema_payload(state.schema),
-            "batches": [_batch_payload(b) for b in state.batches],
+            "batches": [_batch_payload(b, by_batch.get(b.id)) for b in state.batches],
+            "retirements": [_retirement_payload(r) for r in state.retirements],
         }
 
     @app.get("/api/schema")
@@ -255,7 +293,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         data = await _read_upload(file)
         batch = lake.upload_csv(resolved, version, data)
         return JSONResponse(_batch_payload(batch), status_code=201)
-
     @app.get("/api/batches/{batch_id}")
     def api_batch(batch_id: str, format: str = "json"):
         view = lake.get_batch(resolved, batch_id)
@@ -279,6 +316,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "batch": _batch_payload(view.batch),
             "columns": columns,
             "rows": rows,
+        }
+
+    @app.post("/api/batches/{batch_id}/retire", status_code=201)
+    async def api_retire_batch(request: Request, batch_id: str):
+        payload = await _json_body(request)
+        reason = payload.get("reason")
+        retirement = lake.request_retirement(resolved, batch_id, reason)
+        return JSONResponse(_retirement_payload(retirement), status_code=201)
+
+    @app.get("/api/retirements")
+    def api_retirements():
+        return {
+            "retirements": [
+                _retirement_payload(r) for r in lake.list_retirements(resolved)
+            ]
         }
 
     @app.get("/api/integrity")
@@ -341,6 +393,7 @@ _ERROR_TITLES = {
     "not_found": "未找到",
     "storage_error": "存储错误",
     "integrity_error": "数据完整性错误",
+    "batch_retired": "批次已清退",
     "bad_request": "请求无效",
 }
 
@@ -417,8 +470,10 @@ def _schema_payload(schema: lake.Schema) -> dict:
     }
 
 
-def _batch_payload(batch: lake.Batch) -> dict:
-    return {
+def _batch_payload(
+    batch: lake.Batch, retirement: lake.Retirement | None = None
+) -> dict:
+    payload = {
         "id": batch.id,
         "short_id": batch.short_id,
         "created_at": batch.created_at,
@@ -427,6 +482,25 @@ def _batch_payload(batch: lake.Batch) -> dict:
         "file_name": batch.file_name,
         "file_sha256": batch.file_sha256,
         "fields_at_upload": list(batch.fields_at_upload),
+    }
+    if retirement is not None:
+        payload["retirement"] = _retirement_payload(retirement)
+    return payload
+
+
+def _retirement_payload(retirement: lake.Retirement) -> dict:
+    return {
+        "batch_id": retirement.batch_id,
+        "reason": retirement.reason,
+        "status": retirement.status,
+        "status_label": retirement.status_label,
+        "requested_by": retirement.requested_by,
+        "requested_at": retirement.requested_at,
+        "updated_at": retirement.updated_at,
+        "last_error": retirement.last_error,
+        "attempts": retirement.attempts,
+        "blocks_reads": retirement.blocks_reads,
+        "retired": retirement.is_retired,
     }
 
 

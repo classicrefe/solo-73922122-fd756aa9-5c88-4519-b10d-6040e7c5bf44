@@ -91,8 +91,11 @@
         <h2>
           批次列表
           <span class="hint">共 {{ state.batches|length }} 批；按<strong>当前</strong>列名查看</span>
+          <a class="head-link" href="/retirements">清退回查 →</a>
         </h2>
         {% if state.batches %}
+        {% set retirement_map = {} %}
+        {% for r in state.retirements %}{% set _ = retirement_map.update({r.batch_id: r}) %}{% endfor %}
         <table class="data">
           <thead>
             <tr>
@@ -100,21 +103,42 @@
               <th>入湖时间 (UTC)</th>
               <th>行数</th>
               <th>上传时结构</th>
+              <th>清退状态</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
           {% for batch in state.batches %}
-            <tr>
-              <td><a href="/batches/{{ batch.id }}"><code>{{ batch.short_id }}</code></a></td>
+            {% set rt = retirement_map.get(batch.id) %}
+            <tr{% if rt %} class="retired-row"{% endif %}>
+              <td>
+                {% if rt %}<code>{{ batch.short_id }}</code>{% else %}<a href="/batches/{{ batch.id }}"><code>{{ batch.short_id }}</code></a>{% endif %}
+              </td>
               <td class="num">{{ batch.created_at }}</td>
               <td class="num">{{ batch.row_count }}</td>
               <td class="muted num">v{{ batch.schema_version }}</td>
               <td>
+                {% if rt %}
+                <span class="badge {{ 'ok' if rt.is_retired else 'err' }}">{{ rt.status_label }}</span>
+                {% else %}
+                <span class="badge gray">在役</span>
+                {% endif %}
+              </td>
+              <td>
                 <div class="row-actions">
+                  {% if rt %}
+                  <a href="/retirements">回查</a>
+                  {% else %}
                   <a href="/batches/{{ batch.id }}">查看</a>
                   <a href="/batches/{{ batch.id }}/download.csv">CSV</a>
                   <a href="/batches/{{ batch.id }}/download.parquet">Parquet</a>
+                  <form class="inline-form retire-form" method="post" action="/batches/{{ batch.id }}/retire"
+                        data-confirm="确认清退批次 {{ batch.short_id }}？受理后将永久拒绝该批的新查看及 CSV/Parquet 下载，原件在所有进行中的读取结束后物理删除，且不可恢复。">
+                    <input class="reason" type="text" name="reason" placeholder="清退原因（必填）"
+                           maxlength="500" required aria-label="清退原因">
+                    <button class="danger" type="submit">清退</button>
+                  </form>
+                  {% endif %}
                 </div>
               </td>
             </tr>

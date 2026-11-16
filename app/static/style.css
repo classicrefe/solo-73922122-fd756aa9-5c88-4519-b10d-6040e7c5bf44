@@ -188,3 +188,12 @@ footer.foot {
 code { font-family: var(--mono); background: #eef2f7; border-radius: 4px; padding: 1px 5px; font-size: 12.5px; }
 ul.plain { margin: 0; padding-left: 18px; font-size: 13px; }
 ul.plain li { margin: 3px 0; }
+
+section.panel > h2 .head-link { margin-left: auto; font-size: 12.5px; font-weight: 500; }
+input[type=text].reason { width: 220px; }
+.retire-inline { margin-top: 14px; }
+.retire-inline .grow input { width: 100%; }
+.retired-row td { background: #faf6f6; }
+.mono-full { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
+.reason-cell { max-width: 280px; white-space: normal; word-break: break-word; }
+table.data .retire-form { flex-wrap: nowrap; }

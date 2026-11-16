@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>批次清退回查 · 气象观测数据湖</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <h1>批次清退回查</h1>
+  <span class="sub">受理即永久拒绝新查看 / CSV / Parquet 下载 · 原件物理删除后才标记“已清退”</span>
+  <span class="instance">实例 {{ settings.instance_name }}</span>
+</header>
+
+<main>
+  <div class="crumbs"><a href="/">← 返回数据湖</a></div>
+  {% if msg %}<div class="flash {{ kind }}">{{ msg }}</div>{% endif %}
+
+  <section class="panel">
+    <h2>
+      清退登记
+      <span class="hint">共 {{ retirements|length }} 条；保留批号、清退原因与状态供回查</span>
+    </h2>
+    {% if retirements %}
+    <div class="table-scroll">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>批号</th>
+            <th>清退原因</th>
+            <th>状态</th>
+            <th>受理实例</th>
+            <th>受理时间 (UTC)</th>
+            <th>最近更新 (UTC)</th>
+            <th>尝试次数</th>
+            <th>最近错误</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for rt in retirements %}
+          <tr>
+            <td><code>{{ rt.batch_id[:8] }}</code><div class="muted mono-full">{{ rt.batch_id }}</div></td>
+            <td class="reason-cell">{{ rt.reason }}</td>
+            <td><span class="badge {{ 'ok' if rt.is_retired else 'err' }}">{{ rt.status_label }}</span></td>
+            <td class="num">{{ rt.requested_by }}</td>
+            <td class="num">{{ rt.requested_at }}</td>
+            <td class="num">{{ rt.updated_at }}</td>
+            <td class="num">{{ rt.attempts }}</td>
+            <td class="muted reason-cell">{{ rt.last_error if rt.last_error else "—" }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="notice info">
+      状态说明：<strong>待清理</strong> = 已受理，等待进行中的读取结束或等待回收轮次；
+      <strong>清理失败（待自动重试）</strong> = 删除原件失败，原因已保留，权限恢复后自动续清；
+      <strong>已清退</strong> = Parquet 原件已确认从共享卷删除。服务重启不会遗忘或复供任何批次。
+    </div>
+    {% else %}
+    <p class="muted">还没有清退登记。可在首页批次列表中填写原因后提交清退。</p>
+    {% endif %}
+  </section>
+
+  <section class="panel">
+    <h2>在役批次（可发起清退）</h2>
+    {% set retired_ids = retirements | map(attribute='batch_id') | list %}
+    {% set active_batches = batches | rejectattr('id', 'in', retired_ids) | list %}
+    {% if active_batches %}
+    <table class="data">
+      <thead>
+        <tr><th>批号</th><th>入湖时间 (UTC)</th><th>行数</th><th></th></tr>
+      </thead>
+      <tbody>
+      {% for batch in active_batches %}
+        <tr>
+          <td><a href="/batches/{{ batch.id }}"><code>{{ batch.short_id }}</code></a></td>
+          <td class="num">{{ batch.created_at }}</td>
+          <td class="num">{{ batch.row_count }}</td>
+          <td>
+            <form class="inline-form retire-form" method="post" action="/batches/{{ batch.id }}/retire"
+                  data-confirm="确认清退批次 {{ batch.short_id }}？受理后将永久拒绝该批的新查看及 CSV/Parquet 下载，原件在所有进行中的读取结束后物理删除，且不可恢复。">
+              <input class="reason" type="text" name="reason" placeholder="清退原因（必填）"
+                     maxlength="500" required aria-label="清退原因">
+              <button class="danger" type="submit">清退</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">没有在役批次。</p>
+    {% endif %}
+  </section>
+</main>
+
+<footer class="foot">
+  实例 {{ settings.instance_name }} · 清退登记持久化在共享 SQLite，双实例任一方均可受理与回收。
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

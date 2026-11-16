@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import io
 import json
@@ -23,6 +24,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -42,17 +44,32 @@ MAX_ROWS = 1000
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_STATION_LENGTH = 256
 MAX_FIELD_NAME_LENGTH = 64
+MAX_REASON_LENGTH = 500
 
 STATION_COLUMN = "station_id"
 TIME_COLUMN = "observed_at"
 RESERVED_NAMES = {STATION_COLUMN.casefold(), TIME_COLUMN.casefold()}
 FIELD_ID_RE = re.compile(r"^f_[0-9a-f]{32}$")
+BATCH_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 INT_RE = re.compile(r"^[+-]?\d+$")
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
 
 SCHEMA_VERSION_KEY = "schema_version"
 UPLOAD_METADATA_PREFIX = b"metlake."
+
+# 清退状态机：受理后先 pending_cleanup；删除失败转 cleanup_failed 并保留原因，
+# 下一轮回收自动重试；文件确实删除后才置 retired。
+RETIREMENT_PENDING = "pending_cleanup"
+RETIREMENT_FAILED = "cleanup_failed"
+RETIREMENT_DONE = "retired"
+RETIREMENT_STATUSES = (RETIREMENT_PENDING, RETIREMENT_FAILED, RETIREMENT_DONE)
+RETIREMENT_STATUS_LABELS = {
+    RETIREMENT_PENDING: "待清理",
+    RETIREMENT_FAILED: "清理失败（待自动重试）",
+    RETIREMENT_DONE: "已清退",
+}
+DEFAULT_REAP_INTERVAL = 1.0
 
 
 class LakeError(Exception):
@@ -95,6 +112,13 @@ class BatchIntegrityError(LakeError):
     code = "integrity_error"
 
 
+class BatchRetired(LakeError):
+    """批次已被清退受理：永久拒绝新的查看 / CSV / Parquet 读取。"""
+
+    status_code = 410
+    code = "batch_retired"
+
+
 # ---------------------------------------------------------------------------
 # 配置 / 数据库基础
 # ---------------------------------------------------------------------------
@@ -104,16 +128,31 @@ class BatchIntegrityError(LakeError):
 class Settings:
     data_dir: Path
     instance_name: str = "local"
+    reap_interval: float = DEFAULT_REAP_INTERVAL
 
     @classmethod
     def from_env(
         cls,
         data_dir: str | os.PathLike[str] | None = None,
         instance_name: str | None = None,
+        reap_interval: float | None = None,
     ) -> "Settings":
         resolved = Path(data_dir or os.environ.get("DATA_DIR", "./data")).expanduser()
         name = instance_name or os.environ.get("INSTANCE_NAME", "local")
-        return cls(data_dir=resolved.resolve(), instance_name=name)
+        if reap_interval is None:
+            raw = os.environ.get("METLAKE_REAP_INTERVAL")
+            if raw:
+                try:
+                    reap_interval = max(0.05, float(raw))
+                except ValueError:
+                    reap_interval = DEFAULT_REAP_INTERVAL
+            else:
+                reap_interval = DEFAULT_REAP_INTERVAL
+        return cls(
+            data_dir=resolved.resolve(),
+            instance_name=name,
+            reap_interval=float(reap_interval),
+        )
 
     @property
     def db_path(self) -> Path:
@@ -123,9 +162,14 @@ class Settings:
     def parquet_dir(self) -> Path:
         return self.data_dir / "parquet"
 
+    @property
+    def lock_dir(self) -> Path:
+        return self.data_dir / "read_locks"
+
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)
@@ -168,9 +212,36 @@ class Batch:
 
 
 @dataclass(frozen=True)
+class Retirement:
+    batch_id: str
+    reason: str
+    status: str
+    requested_by: str
+    requested_at: str
+    updated_at: str
+    last_error: str | None
+    attempts: int
+
+    @property
+    def status_label(self) -> str:
+        return RETIREMENT_STATUS_LABELS.get(self.status, self.status)
+
+    @property
+    def is_retired(self) -> bool:
+        return self.status == RETIREMENT_DONE
+
+    @property
+    def blocks_reads(self) -> bool:
+        """受理即拒绝新读取（任何状态都不再放行）。"""
+
+        return self.status in RETIREMENT_STATUSES
+
+
+@dataclass(frozen=True)
 class LakeState:
     schema: Schema
     batches: tuple[Batch, ...]
+    retirements: tuple[Retirement, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -207,6 +278,17 @@ def set_before_commit_hook(hook: Callable[[], None] | None) -> None:
 
     global _before_commit_hook
     _before_commit_hook = hook
+
+
+# 仅测试使用：读取获准后、真正打开 Parquet 前的钩子（可在此模拟慢读取）。
+_open_read_session_hook: Callable[[str], None] | None = None
+
+
+def set_open_read_session_hook(hook: Callable[[str], None] | None) -> None:
+    """测试钩子：读取会话已获准并持有共享锁后执行。生产路径不设置。"""
+
+    global _open_read_session_hook
+    _open_read_session_hook = hook
 
 
 def _connect(settings: Settings) -> sqlite3.Connection:
@@ -295,6 +377,27 @@ def initialize(settings: Settings) -> None:
                 "ON batches(created_at DESC)"
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retirements (
+                    batch_id TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('pending_cleanup', 'cleanup_failed', 'retired')
+                    ),
+                    requested_by TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_error TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(batch_id) REFERENCES batches(id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_retirements_status "
+                "ON retirements(status, requested_at DESC)"
+            )
+            conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES (?, '0')",
                 (SCHEMA_VERSION_KEY,),
             )
@@ -378,6 +481,19 @@ def _rows_to_batch(row: sqlite3.Row) -> Batch:
     )
 
 
+def _row_to_retirement(row: sqlite3.Row) -> Retirement:
+    return Retirement(
+        batch_id=row["batch_id"],
+        reason=row["reason"],
+        status=row["status"],
+        requested_by=row["requested_by"],
+        requested_at=row["requested_at"],
+        updated_at=row["updated_at"],
+        last_error=row["last_error"],
+        attempts=int(row["attempts"]),
+    )
+
+
 def _query_schema(conn: sqlite3.Connection) -> Schema:
     version_row = conn.execute(
         "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
@@ -406,7 +522,7 @@ def _query_schema(conn: sqlite3.Connection) -> Schema:
 
 
 def read_state(settings: Settings) -> LakeState:
-    """在一个读事务中取得一致的结构 + 批次登记快照。"""
+    """在一个读事务中取得一致的结构 + 批次登记 + 清退登记快照。"""
 
     try:
         with _read_transaction(settings) as conn:
@@ -417,9 +533,17 @@ def read_state(settings: Settings) -> LakeState:
                 "ORDER BY created_at DESC, id DESC"
             ).fetchall()
             batches = tuple(_rows_to_batch(r) for r in rows)
+            retirement_rows = conn.execute(
+                "SELECT batch_id, reason, status, requested_by, requested_at, "
+                "updated_at, last_error, attempts FROM retirements "
+                "ORDER BY requested_at DESC, batch_id DESC"
+            ).fetchall()
+            retirements = tuple(_row_to_retirement(r) for r in retirement_rows)
     except sqlite3.Error as exc:
         raise StorageError("读取数据湖状态失败。") from exc
-    return LakeState(schema=schema, batches=batches)
+    return LakeState(
+        schema=schema, batches=batches, retirements=retirements
+    )
 
 
 def read_schema(settings: Settings) -> Schema:
@@ -964,8 +1088,18 @@ def _commit_batch(
 
 
 def get_batch(settings: Settings, batch_id: str) -> BatchView:
-    """读取批次；结构快照与批次登记来自同一个已提交读事务。"""
+    """读取批次；结构快照与批次登记来自同一个已提交读事务。
 
+    清退准入采用两段式，保证“此前已获准的读取仍返回完整原结果”：
+
+    1. 先在短读事务中确认批次未被清退受理；
+    2. 取得该批次的共享读锁（``flock LOCK_SH``）后再次确认清退状态。
+       清退回收必须持有同一把锁的排他锁才能删文件，因此只要读取会话
+       未结束（即使长时间暂停），原件就不会被删除；进程退出时内核自动
+       释放 flock，回收随后自动继续。
+    """
+
+    _validate_batch_id(batch_id)
     try:
         with _read_transaction(settings) as conn:
             schema = _query_schema(conn)
@@ -974,15 +1108,73 @@ def get_batch(settings: Settings, batch_id: str) -> BatchView:
                 "file_sha256, schema_json FROM batches WHERE id = ?",
                 (batch_id,),
             ).fetchone()
+            retirement_row = conn.execute(
+                "SELECT status, reason FROM retirements WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
     except sqlite3.Error as exc:
         raise StorageError("读取批次失败。") from exc
 
     if row is None:
         raise NotFound("批次不存在。")
+    if retirement_row is not None:
+        raise _retired_error(batch_id, retirement_row["reason"])
+
     batch = _rows_to_batch(row)
-    physical = _read_physical_table(settings, batch)
+    with read_session(settings, batch_id):
+        physical = _read_physical_table(settings, batch)
     current = _materialize_current_table(physical, schema)
     return BatchView(schema=schema, batch=batch, table=current)
+
+
+def _retired_error(batch_id: str, reason: str) -> BatchRetired:
+    return BatchRetired(
+        f"批次 {batch_id[:8]} 已被清退（原因：{reason}），"
+        "该批的新查看及 CSV / Parquet 下载已被永久拒绝。"
+    )
+
+
+def _validate_batch_id(batch_id: str) -> None:
+    if not isinstance(batch_id, str) or not BATCH_ID_RE.fullmatch(batch_id):
+        raise NotFound("批次不存在。")
+
+
+@contextmanager
+def read_session(settings: Settings, batch_id: str) -> Iterator[None]:
+    """共享读锁会话：持锁期间清退回收无法删除该批原件。
+
+    锁由内核在句柄关闭（含进程崩溃 / 被杀死）时自动释放，无需心跳。
+    取得锁后再做一次清退状态检查，闭合“检查通过但清退先拿到排他锁”的竞态。
+    """
+
+    settings.lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = settings.lock_dir / f"{batch_id}.lock"
+    handle = open(lock_path, "a+")
+    acquired = False
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        acquired = True
+        # 第二阶段确认：锁内复查清退登记。
+        try:
+            with _read_transaction(settings) as conn:
+                retirement_row = conn.execute(
+                    "SELECT reason FROM retirements WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError("读取批次失败。") from exc
+        if retirement_row is not None:
+            raise _retired_error(batch_id, retirement_row["reason"])
+        if _open_read_session_hook is not None:
+            _open_read_session_hook(batch_id)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                log.exception("释放读锁失败 %s", lock_path)
+        handle.close()
 
 
 def _read_physical_table(settings: Settings, batch: Batch) -> pa.Table:
@@ -1105,6 +1297,9 @@ def sample_csv(schema: Schema, rows: int = 5) -> bytes:
 def check_integrity(settings: Settings) -> IntegrityReport:
     state = read_state(settings)
     registered = {b.file_name for b in state.batches}
+    retired_batch_ids = {
+        r.batch_id for r in state.retirements if r.status == RETIREMENT_DONE
+    }
     missing: list[str] = []
     mismatched: list[str] = []
     try:
@@ -1120,6 +1315,9 @@ def check_integrity(settings: Settings) -> IntegrityReport:
         raise StorageError("扫描 Parquet 目录失败。") from exc
 
     for batch in state.batches:
+        # 已清退批次的 Parquet 已按流程永久删除，缺失属预期，不再计入异常。
+        if batch.id in retired_batch_ids:
+            continue
         path = settings.parquet_dir / batch.file_name
         if not path.is_file():
             missing.append(batch.file_name)
@@ -1148,3 +1346,269 @@ def check_integrity(settings: Settings) -> IntegrityReport:
         orphan_files=tuple(orphans),
         temp_files=tuple(temp_files),
     )
+
+
+# ---------------------------------------------------------------------------
+# 批次清退：受理登记 + 读锁协调的后台物理回收
+# ---------------------------------------------------------------------------
+
+
+def normalize_retirement_reason(raw: str | None) -> str:
+    if raw is None:
+        raise ValidationError("清退原因不能为空。")
+    reason = unicodedata.normalize("NFC", str(raw)).strip()
+    if not reason:
+        raise ValidationError("清退原因不能为空。")
+    if len(reason) > MAX_REASON_LENGTH:
+        raise ValidationError(f"清退原因最长 {MAX_REASON_LENGTH} 个字符。")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in reason):
+        raise ValidationError("清退原因不能包含控制字符。")
+    return reason
+
+
+def request_retirement(
+    settings: Settings, batch_id: str, raw_reason: str
+) -> Retirement:
+    """受理一批清退：只做短数据库事务，立即返回，不等待任何读取结束。
+
+    * 受理后该批的新读取（页面 / CSV / Parquet / JSON）被永久拒绝（410）；
+    * 重复清退复用原登记：原因、状态、目录权限均保持首次受理的设置；
+    * 不修改任何目录权限（不 chmod / chown），仅在缺失时创建锁目录。
+    """
+
+    _validate_batch_id(batch_id)
+    reason = normalize_retirement_reason(raw_reason)
+    now = _utc_now_iso()
+    try:
+        with _write_transaction(settings) as conn:
+            batch = conn.execute(
+                "SELECT id FROM batches WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if batch is None:
+                raise NotFound("批次不存在，无法清退。")
+            existing = conn.execute(
+                "SELECT batch_id, reason, status, requested_by, requested_at, "
+                "updated_at, last_error, attempts FROM retirements WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if existing is not None:
+                # 重复清退：原样返回既有登记，不改管理员填写的原因与权限设置。
+                log.info("retirement of %s requested again, reusing %s",
+                         batch_id, existing["status"])
+                return _row_to_retirement(existing)
+            conn.execute(
+                "INSERT INTO retirements(batch_id, reason, status, requested_by, "
+                "requested_at, updated_at, last_error, attempts) "
+                "VALUES (?, ?, ?, ?, ?, ?, NULL, 0)",
+                (
+                    batch_id,
+                    reason,
+                    RETIREMENT_PENDING,
+                    settings.instance_name,
+                    now,
+                    now,
+                ),
+            )
+    except LakeError:
+        raise
+    except sqlite3.Error as exc:
+        raise StorageError("受理清退失败，批次登记未改变。") from exc
+    log.info("retirement accepted batch=%s reason=%r", batch_id, reason)
+    # 通知本实例回收线程尽快跑一轮；其他实例按自己的轮询间隔跟进。
+    ReaperCoordinator.wake(settings)
+    return get_retirement(settings, batch_id)
+
+
+def get_retirement(settings: Settings, batch_id: str) -> Retirement:
+    try:
+        with _read_transaction(settings) as conn:
+            row = conn.execute(
+                "SELECT batch_id, reason, status, requested_by, requested_at, "
+                "updated_at, last_error, attempts FROM retirements WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise StorageError("读取清退登记失败。") from exc
+    if row is None:
+        raise NotFound("该批次没有清退登记。")
+    return _row_to_retirement(row)
+
+
+def list_retirements(settings: Settings) -> tuple[Retirement, ...]:
+    return read_state(settings).retirements
+
+
+def _try_exclusive_batch_lock(settings: Settings, batch_id: str):
+    """非阻塞尝试该批次的排他锁；被活读者占用时返回 None，绝不等待。"""
+
+    settings.lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = settings.lock_dir / f"{batch_id}.lock"
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    except OSError as exc:
+        handle.close()
+        raise StorageError(f"获取批次 {batch_id[:8]} 的回收锁失败。") from exc
+    return handle
+
+
+def reap_pending_retirements(settings: Settings) -> int:
+    """执行一轮回收，返回本轮真正完成清退（文件已删除）的批次数。
+
+    每个批次独立处理：某批读取 / 删除停顿或失败，不影响其他批次的回收、
+    上传与取数。删除失败只更新该批状态为 cleanup_failed 并保留原因，
+    等待下一轮（含服务重启后）自动续清。
+    """
+
+    try:
+        with _read_transaction(settings) as conn:
+            rows = conn.execute(
+                "SELECT r.batch_id AS batch_id, r.reason AS reason, r.status AS status, "
+                "r.attempts AS attempts, b.file_name AS file_name "
+                "FROM retirements r JOIN batches b ON b.id = r.batch_id "
+                "WHERE r.status IN (?, ?) ORDER BY r.requested_at ASC",
+                (RETIREMENT_PENDING, RETIREMENT_FAILED),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise StorageError("查询待清退批次失败。") from exc
+
+    completed = 0
+    for row in rows:
+        if _reap_one(settings, row):
+            completed += 1
+    return completed
+
+
+def _reap_one(settings: Settings, row: sqlite3.Row) -> bool:
+    batch_id = row["batch_id"]
+    file_name = row["file_name"]
+    attempts = int(row["attempts"])
+    lock_handle = _try_exclusive_batch_lock(settings, batch_id)
+    if lock_handle is None:
+        # 仍有活读者（共享锁），跳过本批；慢读取不会拖住其他批次。
+        log.info("batch %s still being read, defer reclamation", batch_id[:8])
+        return False
+    try:
+        data_path = settings.parquet_dir / file_name
+        now = _utc_now_iso()
+        try:
+            if data_path.is_file():
+                data_path.unlink()
+                _fsync_dir(settings.parquet_dir)
+            file_gone = not data_path.exists()
+        except OSError as exc:
+            file_gone = False
+            error_text = f"删除 Parquet 失败：{exc}"
+            log.warning("batch %s reclamation failed: %s", batch_id[:8], exc)
+
+        try:
+            with _write_transaction(settings) as conn:
+                if file_gone:
+                    conn.execute(
+                        "UPDATE retirements SET status = ?, updated_at = ?, "
+                        "last_error = NULL, attempts = ? WHERE batch_id = ?",
+                        (RETIREMENT_DONE, now, attempts + 1, batch_id),
+                    )
+                else:
+                    # 删除失败：保留待清理状态与原因，权限恢复后下一轮自动续清。
+                    conn.execute(
+                        "UPDATE retirements SET status = ?, updated_at = ?, "
+                        "last_error = ?, attempts = ? WHERE batch_id = ?",
+                        (RETIREMENT_FAILED, now, error_text, attempts + 1, batch_id),
+                    )
+        except sqlite3.Error as exc:
+            # 数据库写失败也不致命：文件与登记都可在下一轮重新对齐。
+            log.exception("batch %s retirement state update failed", batch_id[:8])
+            raise StorageError("更新清退状态失败。") from exc
+
+        if file_gone:
+            log.info("batch %s retired and parquet removed", batch_id[:8])
+            return True
+        return False
+    finally:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            log.exception("释放回收锁失败 %s", batch_id)
+        lock_handle.close()
+
+
+class ReaperCoordinator:
+    """进程内回收线程管理；同一数据目录只起一个后台线程。"""
+
+    _registry: dict[str, "RetireReaper"] = {}
+    _registry_lock = threading.Lock()
+
+    @classmethod
+    def start(cls, settings: Settings) -> "RetireReaper":
+        key = str(settings.data_dir)
+        with cls._registry_lock:
+            existing = cls._registry.get(key)
+            if existing is not None:
+                existing.refcount += 1
+                return existing
+            reaper = RetireReaper(settings)
+            cls._registry[key] = reaper
+            reaper.refcount = 1
+            reaper.start()
+            return reaper
+
+    @classmethod
+    def stop(cls, settings: Settings) -> None:
+        key = str(settings.data_dir)
+        with cls._registry_lock:
+            reaper = cls._registry.get(key)
+            if reaper is None:
+                return
+            reaper.refcount -= 1
+            if reaper.refcount <= 0:
+                reaper.stop()
+                cls._registry.pop(key, None)
+
+    @classmethod
+    def wake(cls, settings: Settings) -> None:
+        with cls._registry_lock:
+            reaper = cls._registry.get(str(settings.data_dir))
+        if reaper is not None:
+            reaper.wake()
+
+
+class RetireReaper:
+    """后台轮询线程：驱动待清理 / 清理失败批次的物理回收。
+
+    线程崩溃不会丢失状态——所有状态都在 SQLite 与磁盘上，重启后重新接管。
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._stop = threading.Event()
+        self._wake_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"metlake-reaper-{settings.instance_name}",
+            daemon=True,
+        )
+        self.refcount = 0
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def wake(self) -> None:
+        self._wake_event.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake_event.set()
+        self._thread.join(timeout=10)
+
+    def _run(self) -> None:
+        # 启动即先跑一轮，处理上次进程遗留的待清理批次。
+        while not self._stop.is_set():
+            try:
+                reap_pending_retirements(self.settings)
+            except Exception:  # 回收线程不能因单轮异常退出
+                log.exception("清退回收轮次失败，将在下个周期重试")
+            self._wake_event.clear()
+            self._wake_event.wait(timeout=self.settings.reap_interval)

@@ -216,6 +216,71 @@ def main() -> None:
         check("双实例一致性自检", integrity["ok"] and integrity["batches"] == 2, integrity)
         page = httpx.get(f"{B}/")
         check("网页可打开展示过期提示", page.status_code == 200)
+
+        # 8. 按批清退：受理即拒绝新读取，文件实际清除后才报完成
+        retire = httpx.post(
+            f"{A}/api/batches/{old['id']}/retire",
+            json={"reason": "项目结项，旧批次不再供分析"},
+            timeout=15,
+        )
+        check("清退受理返回 201", retire.status_code == 201, retire.text[:160])
+        record = retire.json()
+        check("清退登记保留批号与原因",
+              record["batch_id"] == old["id"] and record["reason"] == "项目结项，旧批次不再供分析")
+        check("受理后 blocks_reads 为真", record["blocks_reads"] is True)
+
+        denied = httpx.get(f"{B}/api/batches/{old['id']}")
+        check("另一实例立即拒绝新读取（410）", denied.status_code == 410, denied.text[:120])
+        for suffix in ("?format=csv", "?format=parquet"):
+            dl = httpx.get(f"{A}/api/batches/{old['id']}{suffix}")
+            check(f"下载被永久拒绝 {suffix}", dl.status_code == 410)
+        web_denied = httpx.get(f"{B}/batches/{old['id']}")
+        check("网页查看同样被拒绝", web_denied.status_code == 410)
+
+        # 无活读者：两个实例的回收线程之一完成物理删除
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            listing = httpx.get(f"{A}/api/retirements").json()["retirements"]
+            rec = next(r for r in listing if r["batch_id"] == old["id"])
+            if rec["status"] == "retired":
+                break
+            time.sleep(0.2)
+        check("文件实际清除后状态变为已清退", rec["status"] == "retired", rec)
+        check("Parquet 原件已从共享卷删除", not old_path.exists())
+        report = httpx.get(f"{B}/api/integrity").json()
+        check("已清退缺文件不计入完整性异常", report["ok"] is True, report)
+
+        # 重复清退复用原登记（原因不被覆盖）
+        again = httpx.post(
+            f"{B}/api/batches/{old['id']}/retire",
+            json={"reason": "重复提交的新原因应被忽略"},
+            timeout=15,
+        )
+        check("重复清退仍返回 201 且复用原状态",
+              again.status_code == 201
+              and again.json()["status"] == "retired"
+              and again.json()["reason"] == "项目结项，旧批次不再供分析")
+        check("清退登记只有一条",
+              len(httpx.get(f"{A}/api/retirements").json()["retirements"]) == 1)
+
+        # 清退不影响其他批次的取数与新上传
+        new_view = httpx.get(f"{A}/api/batches/{new.json()['id']}").json()
+        check("未清退批次仍可正常取数", cell(new_view, 0, "temp_c") == "88")
+        v = httpx.get(f"{A}/api/schema").json()["schema_version"]
+        third = httpx.post(
+            f"{B}/api/batches",
+            data={"version": v},
+            files={"file": ("third.csv", csv_bytes(
+                ["station_id", "observed_at", "temp_c", "humidity"],
+                [["54513", "2026-04-01T00:00:00Z", "3", "60"]],
+            ), "text/csv")},
+            timeout=30,
+        )
+        check("清退后仍可上传新批次", third.status_code == 201, third.text[:120])
+
+        retire_page = httpx.get(f"{A}/retirements")
+        check("清退回查网页可打开", retire_page.status_code == 200
+              and "批次清退回查" in retire_page.text)
         print("\n全部端到端检查通过。")
     finally:
         for path in stops:
